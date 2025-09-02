@@ -801,9 +801,11 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
           BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
     clearOpenSSLError();
     //SEE https://github.com/nginx/nginx/blob/master/src/event/ngx_event_openssl.c
+    // ngx_ssl_write
     int totalWrite = 0;
-    do {
-        int written = SSL_write(s->ssl, data, length);
+    {
+        int expect_write_length = length - totalWrite;
+        int written = SSL_write(s->ssl, data + totalWrite, expect_write_length);
         if (written > 0) {
             totalWrite += written;
         }
@@ -818,18 +820,15 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
                 clearOpenSSLError();
             } else if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
                 clearOpenSSLError();
-                break;
             } else {
                 clearOpenSSLError();
-                break;
             }
         }
         if (s->ssl_write_wants_read
             || s->ssl_write_wants_write
             || s->ssl_write_last_failed) {
-            break;
         }
-    } while (totalWrite < length);
+    }
     loop_ssl_data->msg_more = 0;
     BIO_clear_flags(loop_ssl_data->shared_wbio,
           BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
