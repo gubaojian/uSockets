@@ -17,6 +17,7 @@
 
 #if (defined(LIBUS_USE_OPENSSL) || defined(LIBUS_USE_WOLFSSL))
 
+
 /* These are in sni_tree.cpp */
 void *sni_new();
 void sni_free(void *sni, void(*cb)(void *));
@@ -27,6 +28,7 @@ void *sni_find(void *sni, const char *hostname);
 #include "libusockets.h"
 #include "internal/internal.h"
 #include <string.h>
+#include <stdbool.h>
 
 /* This module contains the entire OpenSSL implementation
  * of the SSL socket and socket context interfaces. */
@@ -51,6 +53,7 @@ struct loop_ssl_data {
 
     int last_write_was_msg_more;
     int msg_more;
+    bool last_write_failed;
 
     BIO *shared_rbio;
     BIO *shared_wbio;
@@ -83,9 +86,25 @@ struct us_internal_ssl_socket_context_t {
 struct us_internal_ssl_socket_t {
     struct us_socket_t s;
     SSL *ssl;
-    int ssl_write_wants_read; // we use this for now
-    int ssl_read_wants_write;
+    bool ssl_write_wants_read; // we use this for now
+    bool ssl_write_wants_write;
+    bool ssl_write_last_failed;
+    bool ssl_read_wants_read;
+    bool ssl_read_wants_write;
 };
+
+//SEE https://github.com/nginx/nginx/blob/master/src/event/ngx_event_openssl.c
+static void cleanOpenSSLError() {
+#ifdef OPENSSL_DEBUG
+    unsigned long errCode;
+    char errMsg[512];
+    while ((errCode = ERR_get_error()) != 0) {
+        ERR_error_string_n(errCode, errMsg, sizeof(errMsg));
+        printf("OpenSSLError: %s \n", errMsg);
+    }
+#endif
+    ERR_clear_error();
+}
 
 int passphrase_cb(char *buf, int size, int rwflag, void *u) {
     const char *passphrase = (const char *) u;
@@ -110,13 +129,18 @@ long BIO_s_custom_ctrl(BIO *bio, int cmd, long num, void *user) {
 }
 
 int BIO_s_custom_write(BIO *bio, const char *data, int length) {
+
     struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *) BIO_get_data(bio);
 
     //printf("BIO_s_custom_write\n");
 
-    loop_ssl_data->last_write_was_msg_more = loop_ssl_data->msg_more || length == 16413;
+    loop_ssl_data->last_write_was_msg_more = loop_ssl_data->msg_more;
     int written = us_socket_write(0, loop_ssl_data->ssl_socket, data, length, loop_ssl_data->last_write_was_msg_more);
-
+    if (length > 0) {
+        if (written < length) {
+            loop_ssl_data->last_write_failed = true;
+        }
+    }
     if (!written) {
         BIO_set_flags(bio, BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_WRITE);
         return -1;
@@ -440,6 +464,9 @@ SSL_CTX *create_ssl_context_from_options(struct us_socket_context_options_t opti
     /* Default options we rely on - changing these will break our logic */
     SSL_CTX_set_read_ahead(ssl_context, 1);
     SSL_CTX_set_mode(ssl_context, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
+    //max is 16384, smaller than this is more safe
+    SSL_CTX_set_max_send_fragment(ssl_context, 16384  - 256);
 
     /* Anything below TLS 1.2 is disabled */
     SSL_CTX_set_min_proto_version(ssl_context, TLS1_2_VERSION);
@@ -768,38 +795,55 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
     // what we need to do is to check if this ever is non-zero and print a warning
 
 
-
-    loop_ssl_data->ssl_read_input_length = 0;
-
-
     loop_ssl_data->ssl_socket = &s->s;
     loop_ssl_data->msg_more = msg_more;
     loop_ssl_data->last_write_was_msg_more = 0;
-    //printf("Calling SSL_write\n");
-    int written = SSL_write(s->ssl, data, length);
-    //printf("Returning from SSL_write\n");
+    loop_ssl_data->last_write_failed = false;
+    s->ssl_write_last_failed = false;
+    s->ssl_write_wants_read = false;
+    s->ssl_write_wants_write = false;
+    //SEE https://github.com/nginx/nginx/blob/master/src/event/ngx_event_openssl.c
+    int totalWrite = 0;
+    do {
+        int written = SSL_write(s->ssl, data, length);
+        if (written > 0) {
+            totalWrite += written;
+        }
+        s->ssl_write_last_failed = loop_ssl_data->last_write_failed;
+        if (written <= 0) {
+            int err = SSL_get_error(s->ssl, written);
+            if (err == SSL_ERROR_WANT_READ) {
+                s->ssl_write_wants_read = true;
+                cleanOpenSSLError();
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                s->ssl_write_wants_write = true;
+                cleanOpenSSLError();
+            } else if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+                cleanOpenSSLError();
+                break;
+            } else {
+                cleanOpenSSLError();
+                break;
+            }
+        }
+        if (s->ssl_write_wants_read
+            || s->ssl_write_wants_write
+            || s->ssl_write_last_failed) {
+            break;
+        }
+    } while (totalWrite < length);
     loop_ssl_data->msg_more = 0;
 
-    if (loop_ssl_data->last_write_was_msg_more && !msg_more) {
-        us_socket_flush(0, &s->s);
-    }
-
-    if (written > 0) {
-        return written;
-    } else {
-        int err = SSL_get_error(s->ssl, written);
-        if (err == SSL_ERROR_WANT_READ) {
-            // here we need to trigger writable event next ssl_read!
-            s->ssl_write_wants_read = 1;
-        } else if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
-            // these two errors may add to the error queue, which is per thread and must be cleared
-            ERR_clear_error();
-
-            // all errors here except for want write are critical and should not happen
+    if (totalWrite >= length && length > 0) {
+        bool needFlush = loop_ssl_data->last_write_was_msg_more && !msg_more;
+        if (length > 32 * 1024) {
+            needFlush = true;
         }
-
-        return 0;
+        if (needFlush) {
+            us_socket_flush(0, &s->s);
+        }
     }
+    return totalWrite;
 }
 
 void *us_internal_ssl_socket_ext(struct us_internal_ssl_socket_t *s) {
