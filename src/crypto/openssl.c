@@ -94,7 +94,7 @@ struct us_internal_ssl_socket_t {
 };
 
 //SEE https://github.com/nginx/nginx/blob/master/src/event/ngx_event_openssl.c
-static void cleanOpenSSLError() {
+static void clearOpenSSLError() {
 #ifdef OPENSSL_DEBUG
     unsigned long errCode;
     char errMsg[512];
@@ -217,6 +217,8 @@ struct us_internal_ssl_socket_t *ssl_on_end(struct us_internal_ssl_socket_t *s) 
     return us_internal_ssl_socket_close(s, 0, NULL);
 }
 
+static char* SSL_READ_ERROR_CLOSE_REASON = "SSL_read error close";
+
 // this whole function needs a complete clean-up
 struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s, void *data, int length) {
     // note: this context can change when we adopt the socket!
@@ -242,12 +244,10 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
             /* Todo: this should also report some kind of clean shutdown */
             return us_internal_ssl_socket_close(s, 0, NULL);
         } else if (ret < 0) {
-
             int err = SSL_get_error(s->ssl, ret);
-
             if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
                 // we need to clear the error queue in case these added to the thread local queue
-                ERR_clear_error();
+                clearOpenSSLError();
             }
 
         }
@@ -256,76 +256,70 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
         return s;
     }
 
-    // bug checking: this loop needs a lot of attention and clean-ups and check-ups
-    int read = 0;
-    restart:
+    //see https://github.com/nginx/nginx/blob/master/src/event/ngx_event_openssl.c
+    s->ssl_read_wants_read = false;
+    s->ssl_read_wants_write = false;
+    BIO_clear_flags(loop_ssl_data->shared_rbio,
+           BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
+
     while (1) {
-        int just_read = SSL_read(s->ssl, loop_ssl_data->ssl_read_output + LIBUS_RECV_BUFFER_PADDING + read, LIBUS_RECV_BUFFER_LENGTH - read);
+        clearOpenSSLError();
+        int read = 0;
+        int last_read = 0;
+        do {
+            last_read = SSL_read(s->ssl, loop_ssl_data->ssl_read_output + LIBUS_RECV_BUFFER_PADDING + read, LIBUS_RECV_BUFFER_LENGTH - read);
+            if (last_read > 0) {
+                read += last_read;
+            }
+        } while (last_read > 0 && read < LIBUS_RECV_BUFFER_LENGTH);
 
-        if (just_read <= 0) {
-            int err = SSL_get_error(s->ssl, just_read);
-
-            // as far as I know these are the only errors we want to handle
-            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-
-                // clear per thread error queue if it may contain something
-                if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
-                    ERR_clear_error();
-                }
-
-                // terminate connection here
-                return us_internal_ssl_socket_close(s, 0, NULL);
-            } else {
-                // emit the data we have and exit
-
-                if (err == SSL_ERROR_WANT_WRITE) {
-                    // here we need to trigger writable event next ssl_read!
-                    s->ssl_read_wants_write = 1;
-                }
-
-                // assume we emptied the input buffer fully or error here as well!
-                if (loop_ssl_data->ssl_read_input_length) {
-                    return us_internal_ssl_socket_close(s, 0, NULL);
-                }
-
-                // cannot emit zero length to app
-                if (!read) {
-                    break;
-                }
-
-                context = (struct us_internal_ssl_socket_context_t *) us_socket_context(0, &s->s);
-
-                s = context->on_data(s, loop_ssl_data->ssl_read_output + LIBUS_RECV_BUFFER_PADDING, read);
-                if (us_socket_is_closed(0, &s->s)) {
-                    return s;
-                }
-
+        if (last_read <= 0) {
+            int err = SSL_get_error(s->ssl, last_read);
+            bool canIgnoreError = false;
+            if (err == SSL_ERROR_WANT_READ) {
+                s->ssl_read_wants_read = true;
+                canIgnoreError = true;
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                s->ssl_read_wants_write = true;
+                canIgnoreError = true;
+            } else if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_NONE) {
+                canIgnoreError = true;
+            }
+            clearOpenSSLError();
+            if (!canIgnoreError) {
+                return us_internal_ssl_socket_close(s, 0, SSL_READ_ERROR_CLOSE_REASON);
                 break;
             }
-
         }
 
-        read += just_read;
-
-        // at this point we might be full and need to emit the data to application and start over
-        if (read == LIBUS_RECV_BUFFER_LENGTH) {
-
+        if (read > 0) {
             context = (struct us_internal_ssl_socket_context_t *) us_socket_context(0, &s->s);
 
-            // emit data and restart
+            // waring this may call ssl write because of websocket reply message
+            // emit data
             s = context->on_data(s, loop_ssl_data->ssl_read_output + LIBUS_RECV_BUFFER_PADDING, read);
             if (us_socket_is_closed(0, &s->s)) {
                 return s;
             }
-
             read = 0;
-            goto restart;
+        }
+
+        if(loop_ssl_data->ssl_read_input_length <=0 ) {
+            break;
+        }
+        if (s->ssl_read_wants_read || s->ssl_read_wants_write) {
+            break;
         }
     }
 
+    BIO_clear_flags(loop_ssl_data->shared_rbio,
+        BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
+
+    // we should wait for epoll write event for writeable, not for this
     // trigger writable if we failed last write with want read
+    /**
     if (s->ssl_write_wants_read) {
-        s->ssl_write_wants_read = 0;
+        s->ssl_write_wants_read = false;
 
         // make sure to update context before we call (context can change if the user adopts the socket!)
         context = (struct us_internal_ssl_socket_context_t *) us_socket_context(0, &s->s);
@@ -335,7 +329,7 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
         if (us_socket_is_closed(0, &s->s)) {
             return s;
         }
-    }
+    }*/
 
     // check this then?
     if (SSL_get_shutdown(s->ssl) & SSL_RECEIVED_SHUTDOWN) {
@@ -359,7 +353,7 @@ struct us_internal_ssl_socket_t *ssl_on_writable(struct us_internal_ssl_socket_t
     // todo: cork here so that we efficiently output both from reading and from writing?
 
     if (s->ssl_read_wants_write) {
-        s->ssl_read_wants_write = 0;
+        s->ssl_read_wants_write = false;
 
         // make sure to update context before we call (context can change if the user adopts the socket!)
         context = (struct us_internal_ssl_socket_context_t *) us_socket_context(0, &s->s);
@@ -802,6 +796,9 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
     s->ssl_write_last_failed = false;
     s->ssl_write_wants_read = false;
     s->ssl_write_wants_write = false;
+    BIO_clear_flags(loop_ssl_data->shared_wbio,
+          BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
+    clearOpenSSLError();
     //SEE https://github.com/nginx/nginx/blob/master/src/event/ngx_event_openssl.c
     int totalWrite = 0;
     do {
@@ -814,15 +811,15 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
             int err = SSL_get_error(s->ssl, written);
             if (err == SSL_ERROR_WANT_READ) {
                 s->ssl_write_wants_read = true;
-                cleanOpenSSLError();
+                clearOpenSSLError();
             } else if (err == SSL_ERROR_WANT_WRITE) {
                 s->ssl_write_wants_write = true;
-                cleanOpenSSLError();
+                clearOpenSSLError();
             } else if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
-                cleanOpenSSLError();
+                clearOpenSSLError();
                 break;
             } else {
-                cleanOpenSSLError();
+                clearOpenSSLError();
                 break;
             }
         }
@@ -833,6 +830,8 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
         }
     } while (totalWrite < length);
     loop_ssl_data->msg_more = 0;
+    BIO_clear_flags(loop_ssl_data->shared_wbio,
+          BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
 
     if (totalWrite >= length && length > 0) {
         bool needFlush = loop_ssl_data->last_write_was_msg_more && !msg_more;
