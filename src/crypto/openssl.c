@@ -310,10 +310,6 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
         if(!canReadNext) {
             break;
         }
-        if (read < LIBUS_RECV_BUFFER_LENGTH) {
-           break;
-        }
-
         retry++;
     }
 
