@@ -92,10 +92,20 @@ int main() {
 	struct us_loop_t *loop = us_create_loop(0, on_wakeup, on_pre, on_post, 0);
 
 	/* Create a socket context for HTTP */
+#ifndef CMAKE_BUILD_USOCKETS
 	struct us_socket_context_options_t options = {};
 	options.key_file_name = "../../misc/key.pem";
 	options.cert_file_name = "../../misc/cert.pem";
 	options.passphrase = "1234";
+#endif
+
+#ifdef CMAKE_BUILD_USOCKETS
+	struct us_socket_context_options_t options = {};
+	options.key_file_name = "../misc/example.com+5-key.pem";
+	options.cert_file_name = "../misc/example.com+5.pem";
+	options.passphrase = "";
+#endif
+
 
 	struct us_socket_context_t *http_context = us_create_socket_context(SSL, loop, sizeof(struct http_context), options);
 
