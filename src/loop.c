@@ -21,6 +21,10 @@
 #include "internal/internal.h"
 #include <stdlib.h>
 
+static char* WS_POLL_TYPE_SOCKET_ERR_CLOSE_REASON = "POLL_TYPE_SOCKET error close";
+static char* WS_BSD_RECV_ERR_CLOSE_REASON = "bsd_recv error close";
+static char* WS_BSD_RECV_SOCKET_ERR_CLOSE_REASON = "bsd_recv SOCKET error close";
+
 /* The loop has 2 fallthrough polls */
 void us_internal_loop_data_init(struct us_loop_t *loop, void (*wakeup_cb)(struct us_loop_t *loop),
     void (*pre_cb)(struct us_loop_t *loop), void (*post_cb)(struct us_loop_t *loop)) {
@@ -222,6 +226,8 @@ struct us_socket_t *us_adopt_accepted_socket(int ssl, struct us_socket_context_t
     return s;
 }
 
+
+
 void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events) {
     switch (us_internal_poll_type(p)) {
     case POLL_TYPE_CALLBACK: {
@@ -303,7 +309,7 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
             /* Such as epollerr epollhup */
             if (error) {
                 /* Todo: decide what code we give here */
-                s = us_socket_close(0, s, 0, NULL);
+                s = us_socket_close(0, s, 0, WS_POLL_TYPE_SOCKET_ERR_CLOSE_REASON);
                 return;
             }
 
@@ -368,7 +374,7 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
                     if (us_socket_is_shut_down(0, s)) {
                         /* We got FIN back after sending it */
                         /* Todo: We should give "CLEAN SHUTDOWN" as reason here */
-                        s = us_socket_close(0, s, 0, NULL);
+                        s = us_socket_close(0, s, 0,WS_BSD_RECV_ERR_CLOSE_REASON);
                     } else {
                         /* We got FIN, so stop polling for readable */
                         us_poll_change(&s->p, us_socket_context(0, s)->loop, us_poll_events(&s->p) & LIBUS_SOCKET_WRITABLE);
@@ -376,7 +382,7 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
                     }
                 } else if (length == LIBUS_SOCKET_ERROR && !bsd_would_block()) {
                     /* Todo: decide also here what kind of reason we should give */
-                    s = us_socket_close(0, s, 0, NULL);
+                    s = us_socket_close(0, s, 0, WS_BSD_RECV_SOCKET_ERR_CLOSE_REASON);
                 }
             }
         }
