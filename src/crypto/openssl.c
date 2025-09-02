@@ -261,8 +261,9 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
     s->ssl_read_wants_write = false;
     BIO_clear_flags(loop_ssl_data->shared_rbio,
            BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
-
-    while (1) {
+    int maxRetryCount = 4;
+    int retry = 0;
+    while (retry < maxRetryCount) {
         clearOpenSSLError();
         int read = 0;
         int last_read = 0;
@@ -272,8 +273,9 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
                 read += last_read;
             }
         } while (last_read > 0 && read < LIBUS_RECV_BUFFER_LENGTH);
-
+        bool canReadNext = true;
         if (last_read <= 0) {
+            canReadNext = false;
             int err = SSL_get_error(s->ssl, last_read);
             bool canIgnoreError = false;
             if (err == SSL_ERROR_WANT_READ) {
@@ -282,7 +284,7 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
             } else if (err == SSL_ERROR_WANT_WRITE) {
                 s->ssl_read_wants_write = true;
                 canIgnoreError = true;
-            } else if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_NONE) {
+            } else if (err == SSL_ERROR_NONE) {
                 canIgnoreError = true;
             }
             clearOpenSSLError();
@@ -304,12 +306,10 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
             read = 0;
         }
 
-        if(loop_ssl_data->ssl_read_input_length <=0 ) {
+        if(!canReadNext) {
             break;
         }
-        if (s->ssl_read_wants_read || s->ssl_read_wants_write) {
-            break;
-        }
+        retry++;
     }
 
     BIO_clear_flags(loop_ssl_data->shared_rbio,
