@@ -261,6 +261,7 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
     s->ssl_read_wants_write = false;
     BIO_clear_flags(loop_ssl_data->shared_rbio,
            BIO_FLAGS_SHOULD_RETRY | BIO_FLAGS_READ | BIO_FLAGS_WRITE);
+    //实际最多尝试两次，因为读缓冲区足够大，4次足够
     int maxRetryCount = 4;
     int retry = 0;
     while (retry < maxRetryCount) {
